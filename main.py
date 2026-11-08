@@ -10,7 +10,7 @@ from pymongo.errors import DuplicateKeyError
 app = FastAPI(title="Durian Farm (MongoDB)")
 
 DEFAULT_ORIGINS = [
-    "https://YOUR_USERNAME.github.io",   # <-- your GitHub username
+    "https://narongchea.github.io",
     "http://localhost:5173", "http://127.0.0.1:5173",
 ]
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()] or DEFAULT_ORIGINS
@@ -19,6 +19,13 @@ app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], a
 db = MongoClient(os.getenv("MONGO_URL", "mongodb://localhost:27017"))[os.getenv("MONGO_DB", "durian_farm")]
 db.trees.create_index("code", unique=True)
 db.users.create_index("username", unique=True)
+
+# one-time: give old trees (like "D1") a numeric "no"
+for t in db.trees.find({"no": {"$exists": False}}):
+    d = re.sub(r"\D", "", t.get("code", ""))
+    n = int(d) if d else 0
+    try: db.trees.update_one({"_id": t["_id"]}, {"$set": {"no": n, "code": str(n) if n else t["code"]}})
+    except DuplicateKeyError: pass
 
 # MUST be set on Render, otherwise everybody is logged out on every restart
 SECRET = os.getenv("SECRET_KEY") or secrets.token_hex(32)
@@ -67,7 +74,7 @@ def send_mail(to, subject, body):
         return
     print(f"\n=== DEV MODE (no email configured) ===\nTo: {to}\n{body}\n")
 
-FAILS = {}  # username -> [count, locked_until]
+FAILS = {}  # key -> [count, locked_until]
 
 # ---------- public routes ----------
 @app.get("/")
@@ -120,7 +127,7 @@ def change_password(body: dict, u: dict = Depends(auth)):
     db.otps.delete_one({"_id": u["username"]})
     return {"token": make_token(u["username"], u.get("pv", 0) + 1)}
 
-# ---------- farm data (same as before, now protected) ----------
+# ---------- farm data ----------
 def next_id(name):
     r = db.counters.find_one_and_update({"_id": name}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
     return r["seq"]
@@ -158,17 +165,58 @@ def register(name):
         if name == "categories": db.types.delete_many({"category_id": id})
         col.delete_one({"id": id}); return {"ok": True}
 
-for n in COLS: register(n)
+for n in COLS:
+    if n != "trees": register(n)   # trees have their own protected routes below
 
-@api.post("/trees-bulk")
-def bulk(body: dict):
-    n = 0
-    for i in range(int(body["start"]), int(body["end"]) + 1):
-        try:
-            db.trees.insert_one({"id": next_id("trees"), "code": f"{body.get('prefix','')}{i}", "note": None}); n += 1
-        except DuplicateKeyError: pass
-    return {"added": n}
+# ---------- trees: numbered 1,2,3... ----------
+def tree_numbers():
+    return sorted(t["no"] for t in db.trees.find({}, {"no": 1}) if t.get("no"))
 
+def tree_gaps():
+    nums = tree_numbers(); have = set(nums)
+    return [i for i in range(1, (nums[-1] if nums else 0) + 1) if i not in have]
+
+def need_password(u, pw):
+    k = "pw:" + u["username"]
+    f = FAILS.get(k, [0, 0])
+    if f[1] > time.time(): raise HTTPException(429, "locked")
+    if not check_pw(str(pw or ""), u["hash"]):
+        f[0] += 1
+        if f[0] >= 5: f = [0, time.time() + 600]
+        FAILS[k] = f
+        raise HTTPException(403, "pw_wrong")
+    FAILS.pop(k, None)
+
+@api.get("/trees")
+def list_trees(): return list(db.trees.find({}, {"_id": 0}).sort([("no", 1)]))
+
+@api.get("/trees-info")
+def trees_info():
+    nums = tree_numbers()
+    return {"max": nums[-1] if nums else 0, "total": len(nums), "gaps": tree_gaps()}
+
+@api.post("/trees-add")
+def trees_add(body: dict, u: dict = Depends(auth)):
+    need_password(u, body.get("password"))
+    count = int(body.get("count") or 0)
+    if not 1 <= count <= 500: raise HTTPException(400, "count")
+    fill = sorted(set(int(x) for x in body.get("fill_gaps", [])) & set(tree_gaps()))[:count]
+    nums = tree_numbers(); start = (nums[-1] if nums else 0) + 1
+    new = fill + list(range(start, start + count - len(fill)))
+    for n in new:
+        db.trees.insert_one({"id": next_id("trees"), "no": n, "code": str(n), "note": None})
+    return {"added": new}
+
+@api.put("/trees/{id}")
+def edit_tree(id: int, body: dict):
+    db.trees.update_one({"id": id}, {"$set": {"note": body.get("note") or None}}); return {"ok": True}
+
+@api.post("/trees/{id}/delete")
+def delete_tree(id: int, body: dict, u: dict = Depends(auth)):
+    need_password(u, body.get("password"))
+    db.trees.delete_one({"id": id}); return {"ok": True}
+
+# ---------- reports ----------
 def key(date, period):
     d = datetime.strptime(date[:10], "%Y-%m-%d")
     return {"day": d.strftime("%Y-%m-%d"), "week": d.strftime("%Y-W%W"), "month": d.strftime("%Y-%m"), "year": d.strftime("%Y")}[period]
